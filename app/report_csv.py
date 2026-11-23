@@ -51,18 +51,45 @@ _INT64_MAX = 2**63 - 1
 # ---------------------------------------------------------------------------
 
 
-def read_text(path: Path) -> tuple[str, str]:
+_DECODE_CHUNK_CHARS = 1 << 20
+
+
+def detect_encoding(path: Path) -> str:
+    """The first encoding that decodes the whole file.
+
+    The file is decoded in chunks and nothing is kept, so a report of several
+    hundred MB never sits in memory as one string.
+    """
     for encoding in _ENCODINGS:
         try:
-            return path.read_text(encoding=encoding), encoding
+            with path.open("r", encoding=encoding, newline="") as handle:
+                while handle.read(_DECODE_CHUNK_CHARS):
+                    pass
+            return encoding
         except UnicodeDecodeError:
             continue
     raise CSVValidationError(f"Could not decode {path} with any of {_ENCODINGS}")
 
 
-def detect_header(text: str) -> tuple[int, str]:
-    """Find the header row: Amazon may prefix report-metadata lines."""
-    for index, line in enumerate(text.splitlines()[:_HEADER_SCAN_LINES]):
+def read_text(path: Path) -> tuple[str, str]:
+    """The whole file as text (small files only; reports use :func:`detect_encoding`)."""
+    encoding = detect_encoding(path)
+    return path.read_text(encoding=encoding), encoding
+
+
+def _head_lines(source: str | Path, encoding: str | None) -> list[str]:
+    if isinstance(source, Path):
+        with source.open("r", encoding=encoding, newline="") as handle:
+            return [line.rstrip("\r\n") for _, line in zip(range(_HEADER_SCAN_LINES), handle)]
+    return source.splitlines()[:_HEADER_SCAN_LINES]
+
+
+def detect_header(source: str | Path, encoding: str | None = None) -> tuple[int, str]:
+    """Find the header row: Amazon may prefix report-metadata lines.
+
+    ``source`` is the file (only its first lines are read) or its text.
+    """
+    for index, line in enumerate(_head_lines(source, encoding)):
         lowered = line.lower()
         if "campaign" in lowered and "date" in lowered:
             delimiter = "\t" if line.count("\t") > line.count(",") else ","
@@ -73,14 +100,26 @@ def detect_header(text: str) -> tuple[int, str]:
     )
 
 
-def check_field_counts(text: str, header_row: int, delimiter: str, path: Path) -> None:
+def check_field_counts(
+    source: str | Path, header_row: int, delimiter: str, path: Path, encoding: str | None = None
+) -> None:
     """Every data row must have exactly as many fields as the header.
 
     Without this, pandas silently turns a row with one field too many into an
-    index and shifts every value one column to the left.
+    index and shifts every value one column to the left.  A file ``source`` is
+    streamed row by row.
     """
-    body = "\n".join(text.splitlines()[header_row:])
-    reader = csv.reader(io.StringIO(body), delimiter=delimiter)
+    if isinstance(source, Path):
+        with source.open("r", encoding=encoding, newline="") as handle:
+            for _ in range(header_row):
+                handle.readline()
+            _check_rows(csv.reader(handle, delimiter=delimiter), header_row, path)
+        return
+    body = "\n".join(source.splitlines()[header_row:])
+    _check_rows(csv.reader(io.StringIO(body), delimiter=delimiter), header_row, path)
+
+
+def _check_rows(reader, header_row: int, path: Path) -> None:
     header = next(reader, [])
     for number, row in enumerate(reader, start=header_row + 2):
         if row and any(cell.strip() for cell in row) and len(row) != len(header):

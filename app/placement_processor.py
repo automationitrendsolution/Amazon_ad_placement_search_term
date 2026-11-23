@@ -38,7 +38,7 @@ import pandas as pd
 from .config import ROW_KEY_COLUMN
 from .exceptions import CSVValidationError, DataTransformationError, DateMismatchError
 from .logging_config import get_logger
-from .report_csv import check_field_counts, detect_header, numeric, parse_report_dates, read_text
+from .report_csv import check_field_counts, detect_encoding, detect_header, numeric, parse_report_dates
 
 logger = get_logger("placement")
 
@@ -231,19 +231,21 @@ def read_placement_report(path: Path) -> pd.DataFrame:
     Raises:
         CSVValidationError: Unreadable, no header, malformed rows, or no Date column.
     """
-    content, encoding = read_text(path)
-    header_row, delimiter = detect_header(content)
-    check_field_counts(content, header_row, delimiter, path)
+    # The file is streamed for these checks: a 7-day report is ~250 MB, and
+    # holding it as one string (plus copies) ran the PC out of memory.
+    encoding = detect_encoding(path)
+    header_row, delimiter = detect_header(path, encoding)
+    check_field_counts(path, header_row, delimiter, path, encoding)
     try:
         frame = pd.read_csv(
             path,
             encoding=encoding,
             sep=delimiter,
             skiprows=header_row,
-            dtype=str,
+            dtype=str,  # every column is text, so chunked parsing cannot mix types
             keep_default_na=False,
             engine="c",
-            low_memory=False,
+            low_memory=True,
         )
     except Exception as exc:
         raise CSVValidationError(f"Could not read {path.name}: {exc}") from exc
